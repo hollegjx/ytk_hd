@@ -6,6 +6,7 @@ import com.qcloud.cos.model.GetObjectRequest;
 import com.qcloud.cos.model.ObjectMetadata;
 import com.qcloud.cos.model.PutObjectRequest;
 import com.qcloud.cos.model.PutObjectResult;
+import com.qcloud.cos.model.ciModel.persistence.PicOperations;
 import learn.gjx.tuku1.config.CosClientConfig;
 import org.springframework.stereotype.Component;
 
@@ -35,6 +36,23 @@ public class CosManager {
     public PutObjectResult putObject(String key, File file) {
         PutObjectRequest putObjectRequest = new PutObjectRequest(
                 cosClientConfig.getBucket(), key, file);
+        return cosClient.putObject(putObjectRequest);
+    }
+
+    /**
+     * 上传图片（附带图片信息解析）
+     *
+     * @param key  对象键
+     * @param file 本地文件
+     * @return 上传结果（包含图片信息）
+     */
+    public PutObjectResult putPictureObject(String key, File file) {
+        PutObjectRequest putObjectRequest = new PutObjectRequest(
+                cosClientConfig.getBucket(), key, file);
+        // 开启图片信息解析（返回原图信息）
+        PicOperations picOperations = new PicOperations();
+        picOperations.setIsPicInfo(1);
+        putObjectRequest.setPicOperations(picOperations);
         return cosClient.putObject(putObjectRequest);
     }
 
