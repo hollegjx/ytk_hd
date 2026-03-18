@@ -15,7 +15,7 @@ import java.io.File;
 import java.io.InputStream;
 
 /**
- * 腾讯云 COS 对象存储操作
+ * Thin wrapper around the Tencent COS client that exposes common object operations.
  */
 @Component
 public class CosManager {
@@ -27,11 +27,7 @@ public class CosManager {
     private COSClient cosClient;
 
     /**
-     * 上传对象（文件）
-     *
-     * @param key  对象键（唯一标识，例如：images/picture.jpg）
-     * @param file 本地文件
-     * @return 上传结果
+     * Upload a local file as the specified object key.
      */
     public PutObjectResult putObject(String key, File file) {
         PutObjectRequest putObjectRequest = new PutObjectRequest(
@@ -40,29 +36,28 @@ public class CosManager {
     }
 
     /**
-     * 上传图片（附带图片信息解析）
-     *
-     * @param key  对象键
-     * @param file 本地文件
-     * @return 上传结果（包含图片信息）
+     * Upload an image while enabling CI to return metadata (width/height/etc.).
      */
     public PutObjectResult putPictureObject(String key, File file) {
-        PutObjectRequest putObjectRequest = new PutObjectRequest(
-                cosClientConfig.getBucket(), key, file);
-        // 开启图片信息解析（返回原图信息）
         PicOperations picOperations = new PicOperations();
         picOperations.setIsPicInfo(1);
-        putObjectRequest.setPicOperations(picOperations);
+        return putPictureObject(key, file, picOperations);
+    }
+
+    /**
+     * Upload an image with custom CI processing rules.
+     */
+    public PutObjectResult putPictureObject(String key, File file, PicOperations picOperations) {
+        PutObjectRequest putObjectRequest = new PutObjectRequest(
+                cosClientConfig.getBucket(), key, file);
+        if (picOperations != null) {
+            putObjectRequest.setPicOperations(picOperations);
+        }
         return cosClient.putObject(putObjectRequest);
     }
 
     /**
-     * 上传对象（输入流）
-     *
-     * @param key         对象键
-     * @param inputStream 输入流
-     * @param metadata    对象元数据（可设置 Content-Type、Content-Length 等）
-     * @return 上传结果
+     * Upload an object from an input stream.
      */
     public PutObjectResult putObject(String key, InputStream inputStream, ObjectMetadata metadata) {
         PutObjectRequest putObjectRequest = new PutObjectRequest(
@@ -71,10 +66,7 @@ public class CosManager {
     }
 
     /**
-     * 下载对象
-     *
-     * @param key 对象键
-     * @return COS 对象（包含输入流和元数据）
+     * Download an object.
      */
     public COSObject getObject(String key) {
         GetObjectRequest getObjectRequest = new GetObjectRequest(
@@ -83,9 +75,7 @@ public class CosManager {
     }
 
     /**
-     * 删除对象
-     *
-     * @param key 对象键
+     * Delete an object by key.
      */
     public void deleteObject(String key) {
         cosClient.deleteObject(cosClientConfig.getBucket(), key);
