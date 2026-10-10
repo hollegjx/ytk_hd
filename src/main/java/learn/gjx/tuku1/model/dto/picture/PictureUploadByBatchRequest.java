@@ -27,6 +27,11 @@ public class PictureUploadByBatchRequest implements Serializable {
     private Integer offset = 0;
 
     /**
+     * 图片名称前缀，未填写时使用搜索关键词
+     */
+    private String namePrefix;
+
+    /**
      * 分类
      */
     private String category;

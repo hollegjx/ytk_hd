@@ -8,7 +8,12 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import learn.gjx.tuku1.exception.BusinessException;
 import learn.gjx.tuku1.exception.ErrorCode;
+import learn.gjx.tuku1.manager.BingImageSearchManager;
 import learn.gjx.tuku1.manager.FileManager;
+import learn.gjx.tuku1.manager.PictureFileCleanupManager;
+import learn.gjx.tuku1.manager.cache.PictureListRevision;
+import learn.gjx.tuku1.manager.cache.PublicPicturePageCache;
+import learn.gjx.tuku1.manager.cache.PublicPictureQuery;
 import learn.gjx.tuku1.mapper.PictureMapper;
 import learn.gjx.tuku1.model.dto.file.PictureUploadResult;
 import learn.gjx.tuku1.model.dto.picture.PictureEditRequest;
@@ -23,26 +28,23 @@ import learn.gjx.tuku1.model.dto.picture.PictureUploadRequest;
 import learn.gjx.tuku1.model.entity.Picture;
 import learn.gjx.tuku1.model.entity.User;
 import learn.gjx.tuku1.model.enums.PictureReviewStatusEnum;
+import learn.gjx.tuku1.model.enums.PictureUploadStatusEnum;
 import learn.gjx.tuku1.model.vo.PictureProcessResult;
 import learn.gjx.tuku1.model.vo.PictureVO;
 import learn.gjx.tuku1.model.vo.UserVO;
 import learn.gjx.tuku1.service.PictureService;
 import learn.gjx.tuku1.service.UserService;
 import lombok.extern.slf4j.Slf4j;
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
-import org.jsoup.select.Elements;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpServletRequest;
-import java.io.IOException;
-import java.io.UnsupportedEncodingException;
-import java.net.URLEncoder;
 import java.util.*;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * {@link PictureService} 的具体实现，依托 MyBatis-Plus 提供 CRUD 与业务扩展。
@@ -56,16 +58,41 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 
     private static final int MAX_BATCH_UPLOAD_COUNT = 30;
 
-    private static final String BING_IMAGE_SEARCH_URL = "https://cn.bing.com/images/async?q=%s&mmasync=1";
-
-    private static final String BING_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-
     @Resource
     private FileManager fileManager;
 
     @Resource
+    private PictureFileCleanupManager pictureFileCleanupManager;
+
+    @Resource
+    private BingImageSearchManager bingImageSearchManager;
+
+    @Resource
+    private TransactionTemplate transactionTemplate;
+
+    @Resource
+    private PictureListRevision pictureListRevision;
+
+    @Resource
+    private PublicPicturePageCache publicPicturePageCache;
+
+    @Resource
     private UserService userService;
+
+    @Override
+    public Page<PictureVO> listPublicPicturePage(PictureQueryRequest queryRequest, HttpServletRequest request) {
+        PictureQueryRequest query = PublicPictureQuery.normalize(queryRequest);
+        Page<Picture> picturePage = publicPicturePageCache.get(query, () -> {
+            QueryWrapper<Picture> wrapper = getQueryWrapper(query);
+            // Deterministic pagination when the primary sort values are equal.
+            if (!"id".equals(query.getSortField())) {
+                wrapper.orderByDesc("id");
+            }
+            return this.page(new Page<>(query.getCurrent(), query.getPageSize()), wrapper);
+        });
+        // Do not cache user profile snapshots or any caller/session-specific response.
+        return getPictureVOPage(picturePage, request);
+    }
 
     @Override
     public PictureVO uploadPicture(MultipartFile multipartFile, PictureUploadRequest pictureUploadRequest, User loginUser) {
@@ -76,6 +103,10 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         if (multipartFile == null || multipartFile.isEmpty()) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "File cannot be empty");
         }
+        validatePictureMetadata(pictureUploadRequest == null ? null : pictureUploadRequest.getName(),
+                pictureUploadRequest == null ? null : pictureUploadRequest.getIntroduction(),
+                pictureUploadRequest == null ? null : pictureUploadRequest.getCategory(),
+                pictureUploadRequest == null ? null : pictureUploadRequest.getTags());
 
         Long pictureId = null;
         if (pictureUploadRequest != null) {
@@ -87,35 +118,47 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         String uploadPathPrefix = getUploadPathPrefix(oldPicture, loginUser);
         PictureUploadResult uploadResult = fileManager.uploadPicture(multipartFile, uploadPathPrefix);
 
-        return saveUploadedPicture(uploadResult, oldPicture, pictureId,
+        return persistUploadedPicture(uploadResult, oldPicture, pictureId,
                 pictureUploadRequest == null ? null : pictureUploadRequest.getName(),
                 pictureUploadRequest == null ? null : pictureUploadRequest.getIntroduction(),
                 pictureUploadRequest == null ? null : pictureUploadRequest.getCategory(),
                 pictureUploadRequest == null ? null : pictureUploadRequest.getTags(),
                 null,
+                false,
                 loginUser);
     }
 
     @Override
     public PictureVO uploadPictureByUrl(PictureUploadByUrlRequest pictureUploadByUrlRequest, User loginUser) {
+        return uploadPictureByUrl(pictureUploadByUrlRequest, loginUser, false);
+    }
+
+    private PictureVO uploadPictureByUrl(PictureUploadByUrlRequest pictureUploadByUrlRequest, User loginUser,
+                                         boolean completed) {
         if (loginUser == null) {
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
         }
         if (pictureUploadByUrlRequest == null || StrUtil.isBlank(pictureUploadByUrlRequest.getFileUrl())) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片 URL 不能为空");
         }
+        if (pictureUploadByUrlRequest.getFileUrl().trim().length() > 1024) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片 URL 过长");
+        }
+        validatePictureMetadata(pictureUploadByUrlRequest.getName(), pictureUploadByUrlRequest.getIntroduction(),
+                pictureUploadByUrlRequest.getCategory(), pictureUploadByUrlRequest.getTags());
         Long pictureId = pictureUploadByUrlRequest.getId();
         Picture oldPicture = getAuthorizedOldPicture(pictureId, loginUser);
 
         String uploadPathPrefix = getUploadPathPrefix(oldPicture, loginUser);
         PictureUploadResult uploadResult = fileManager.uploadPictureByUrl(pictureUploadByUrlRequest.getFileUrl(), uploadPathPrefix);
 
-        return saveUploadedPicture(uploadResult, oldPicture, pictureId,
+        return persistUploadedPicture(uploadResult, oldPicture, pictureId,
                 pictureUploadByUrlRequest.getName(),
                 pictureUploadByUrlRequest.getIntroduction(),
                 pictureUploadByUrlRequest.getCategory(),
                 pictureUploadByUrlRequest.getTags(),
                 pictureUploadByUrlRequest.getFileUrl(),
+                completed,
                 loginUser);
     }
 
@@ -131,6 +174,12 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "搜索关键词不能为空");
         }
         String searchText = pictureUploadByBatchRequest.getSearchText().trim();
+        String namePrefix = StrUtil.blankToDefault(pictureUploadByBatchRequest.getNamePrefix(), searchText).trim();
+        if (searchText.length() > 50 || namePrefix.length() > 100) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "搜索关键词或名称前缀过长");
+        }
+        validatePictureMetadata(namePrefix, null, pictureUploadByBatchRequest.getCategory(),
+                pictureUploadByBatchRequest.getTags());
         Integer count = pictureUploadByBatchRequest.getCount();
         if (count == null) {
             count = DEFAULT_BATCH_UPLOAD_COUNT;
@@ -149,36 +198,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "偏移量不能小于 0");
         }
 
-        String searchUrl = String.format(BING_IMAGE_SEARCH_URL, encodeSearchText(searchText));
-        Document document;
-        try {
-            document = Jsoup.connect(searchUrl)
-                    .userAgent(BING_USER_AGENT)
-                    .referrer("https://cn.bing.com/images/search")
-                    .timeout(10000)
-                    .get();
-        } catch (IOException e) {
-            log.error("获取 Bing 图片搜索结果失败，searchText: {}", searchText, e);
-            throw new BusinessException(ErrorCode.OPERATION_ERROR, "获取图片搜索结果失败");
-        }
-
-        Element dgControl = document.getElementsByClass("dgControl").first();
-        if (dgControl == null) {
-            throw new BusinessException(ErrorCode.OPERATION_ERROR, "未获取到图片搜索结果");
-        }
-        Elements imageElements = dgControl.select("img.mimg");
-        if (CollUtil.isEmpty(imageElements)) {
-            throw new BusinessException(ErrorCode.OPERATION_ERROR, "未获取到图片搜索结果");
-        }
-
-        Set<String> candidateUrlSet = new LinkedHashSet<>();
-        for (Element imageElement : imageElements) {
-            String imageUrl = normalizeImageUrl(imageElement.attr("src"));
-            if (imageUrl != null) {
-                candidateUrlSet.add(imageUrl);
-            }
-        }
-        List<String> candidateUrlList = new ArrayList<>(candidateUrlSet);
+        List<String> candidateUrlList = bingImageSearchManager.search(searchText);
         if (offset >= candidateUrlList.size()) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "偏移量超过可抓取图片数量");
         }
@@ -191,11 +211,11 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
             String imageUrl = candidateUrlList.get(i);
             PictureUploadByUrlRequest uploadByUrlRequest = new PictureUploadByUrlRequest();
             uploadByUrlRequest.setFileUrl(imageUrl);
-            uploadByUrlRequest.setName(searchText + "-" + (i + 1));
+            uploadByUrlRequest.setName(namePrefix + "-" + (successCount + 1));
             uploadByUrlRequest.setCategory(pictureUploadByBatchRequest.getCategory());
             uploadByUrlRequest.setTags(pictureUploadByBatchRequest.getTags());
             try {
-                uploadPictureByUrl(uploadByUrlRequest, loginUser);
+                uploadPictureByUrl(uploadByUrlRequest, loginUser, true);
                 successCount++;
             } catch (Exception e) {
                 log.warn("批量导入单张图片失败，searchText: {}, fileUrl: {}", searchText, imageUrl, e);
@@ -208,47 +228,112 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         return successCount;
     }
 
-    private String encodeSearchText(String searchText) {
-        try {
-            return URLEncoder.encode(searchText, "UTF-8");
-        } catch (UnsupportedEncodingException e) {
-            log.error("搜索关键词编码失败，searchText: {}", searchText, e);
-            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "搜索关键词编码失败");
+    @Override
+    public boolean deletePicture(Long pictureId, User loginUser) {
+        if (pictureId == null || pictureId <= 0) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片 ID 不合法");
         }
+        if (loginUser == null || !userService.isAdmin(loginUser)) {
+            throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "仅管理员可删除图片");
+        }
+        Picture oldPicture = this.getById(pictureId);
+        if (oldPicture == null) {
+            throw new BusinessException(ErrorCode.NOT_FOUND_ERROR, "图片不存在");
+        }
+        Boolean removed = transactionTemplate.execute(status -> {
+            boolean result = this.removeById(pictureId);
+            if (result) {
+                pictureListRevision.advance();
+            }
+            return result;
+        });
+        if (!Boolean.TRUE.equals(removed)) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "删除失败");
+        }
+        cleanupManagedPictureFiles(oldPicture, "delete-picture");
+        return true;
     }
 
-    private String normalizeImageUrl(String imageUrl) {
-        if (StrUtil.isBlank(imageUrl)) {
-            return null;
+    @Override
+    public int cleanExpiredDraftPictures(Date expireBefore, int batchSize) {
+        if (expireBefore == null || batchSize <= 0) {
+            return 0;
         }
-        int queryIndex = imageUrl.indexOf("?");
-        if (queryIndex >= 0) {
-            imageUrl = imageUrl.substring(0, queryIndex);
+        int safeBatchSize = Math.min(batchSize, 200);
+        List<Picture> drafts = this.lambdaQuery()
+                .eq(Picture::getUploadStatus, PictureUploadStatusEnum.DRAFT.getValue())
+                .lt(Picture::getCreateTime, expireBefore)
+                .last("LIMIT " + safeBatchSize)
+                .list();
+        if (CollUtil.isEmpty(drafts)) {
+            return 0;
         }
-        imageUrl = imageUrl.trim();
-        String lowerUrl = imageUrl.toLowerCase(Locale.ROOT);
-        if (!lowerUrl.startsWith("http://") && !lowerUrl.startsWith("https://")) {
-            return null;
+        List<Long> pictureIds = drafts.stream().map(Picture::getId).collect(Collectors.toList());
+        Boolean removed = transactionTemplate.execute(status -> {
+            boolean result = this.removeByIds(pictureIds);
+            if (result) {
+                pictureListRevision.advance();
+            }
+            return result;
+        });
+        if (!Boolean.TRUE.equals(removed)) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "清理图片草稿失败");
         }
-        return imageUrl;
+        drafts.forEach(picture -> cleanupManagedPictureFiles(picture, "expired-draft"));
+        return drafts.size();
+    }
+
+    private PictureVO persistUploadedPicture(PictureUploadResult uploadResult, Picture oldPicture, Long pictureId,
+                                             String name, String introduction, String category, List<String> tags,
+                                             String sourceUrl, boolean completed, User loginUser) {
+        try {
+            PictureVO pictureVO = transactionTemplate.execute(status -> saveUploadedPicture(uploadResult, oldPicture,
+                    pictureId, name, introduction, category, tags, sourceUrl, completed, loginUser));
+            if (pictureVO == null) {
+                throw new BusinessException(ErrorCode.OPERATION_ERROR, "保存图片失败");
+            }
+            if (oldPicture != null) {
+                cleanupManagedPictureFiles(oldPicture, "replace-picture",
+                        uploadResult.getOriginalUrl(), uploadResult.getUrl(), uploadResult.getThumbnailUrl());
+            }
+            return pictureVO;
+        } catch (RuntimeException e) {
+            cleanupUploadedPictureFiles(uploadResult, "rollback-upload");
+            throw e;
+        }
     }
 
     private PictureVO saveUploadedPicture(PictureUploadResult uploadResult, Picture oldPicture, Long pictureId,
                                           String name, String introduction, String category, List<String> tags,
-                                          String sourceUrl, User loginUser) {
+                                          String sourceUrl, boolean completed, User loginUser) {
         String normalizedSourceUrl = normalizeSourceUrl(sourceUrl);
+        String uploadedUrl = uploadResult == null ? null : uploadResult.getUrl();
+        String originalUrl = uploadResult == null
+                ? null : StrUtil.blankToDefault(uploadResult.getOriginalUrl(), uploadedUrl);
+        String thumbnailUrl = uploadResult == null ? null : uploadResult.getThumbnailUrl();
+        if (StrUtil.isBlank(uploadedUrl) || uploadedUrl.length() > 512
+                || StrUtil.isBlank(originalUrl) || originalUrl.length() > 512
+                || StrUtil.length(thumbnailUrl) > 512) {
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "上传图片地址无效");
+        }
         Picture picture = new Picture();
         if (pictureId != null) {
             picture.setId(pictureId);
             picture.setEditTime(new Date());
         }
-        picture.setUrl(uploadResult.getUrl());
+        picture.setUrl(uploadedUrl);
+        picture.setOriginalUrl(originalUrl);
+        picture.setThumbnailUrl(StrUtil.isBlank(thumbnailUrl) ? null : thumbnailUrl);
         picture.setPicSize(uploadResult.getPicSize());
         picture.setPicWidth(uploadResult.getPicWidth());
         picture.setPicHeight(uploadResult.getPicHeight());
         picture.setPicScale(uploadResult.getPicScale());
         picture.setPicFormat(uploadResult.getPicFormat());
         picture.setUserId(oldPicture == null ? loginUser.getId() : oldPicture.getUserId());
+        boolean keepsCompletedStatus = oldPicture != null
+                && Objects.equals(oldPicture.getUploadStatus(), PictureUploadStatusEnum.COMPLETED.getValue());
+        picture.setUploadStatus(completed || keepsCompletedStatus ? PictureUploadStatusEnum.COMPLETED.getValue()
+                : PictureUploadStatusEnum.DRAFT.getValue());
         if (normalizedSourceUrl != null) {
             picture.setSourceUrl(normalizedSourceUrl);
         }
@@ -274,10 +359,14 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         if (pictureId != null && normalizedSourceUrl == null) {
             clearSourceUrl(picture.getId());
         }
+        if (pictureId != null && StrUtil.isBlank(thumbnailUrl)) {
+            clearThumbnailUrl(picture.getId());
+        }
         if (PictureReviewStatusEnum.REVIEWING.getValue() == picture.getReviewStatus()) {
             clearReviewDetail(picture.getId());
         }
 
+        pictureListRevision.advance();
         return PictureVO.objToVo(this.getById(picture.getId()));
     }
 
@@ -319,6 +408,8 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
 
         Long id = picture.getId();
         String url = picture.getUrl();
+        String originalUrl = picture.getOriginalUrl();
+        String thumbnailUrl = picture.getThumbnailUrl();
         String introduction = picture.getIntroduction();
 
         // 更新时必须携带主键
@@ -326,8 +417,14 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "Invalid picture ID");
         }
         // 访问地址需要校验长度
-        if (StrUtil.isNotBlank(url) && url.length() > 1024) {
+        if (StrUtil.isNotBlank(url) && url.length() > 512) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "Picture URL is too long");
+        }
+        if (StrUtil.isNotBlank(originalUrl) && originalUrl.length() > 512) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "Original picture URL is too long");
+        }
+        if (StrUtil.isNotBlank(thumbnailUrl) && thumbnailUrl.length() > 512) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "Thumbnail URL is too long");
         }
         // 简介也需要长度限制
         if (StrUtil.isNotBlank(introduction) && introduction.length() > 500) {
@@ -354,6 +451,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         String picFormat = pictureQueryRequest.getPicFormat();
         String searchText = pictureQueryRequest.getSearchText();
         Long userId = pictureQueryRequest.getUserId();
+        Integer uploadStatus = pictureQueryRequest.getUploadStatus();
         Integer reviewStatus = pictureQueryRequest.getReviewStatus();
         String sortField = pictureQueryRequest.getSortField();
         String sortOrder = pictureQueryRequest.getSortOrder();
@@ -366,6 +464,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         // 精确匹配
         queryWrapper.eq(id != null, "id", id);
         queryWrapper.eq(userId != null, "userId", userId);
+        queryWrapper.eq(uploadStatus != null, "uploadStatus", uploadStatus);
         queryWrapper.eq(StrUtil.isNotBlank(category), "category", category);
         queryWrapper.eq(picWidth != null, "picWidth", picWidth);
         queryWrapper.eq(picHeight != null, "picHeight", picHeight);
@@ -481,6 +580,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public boolean reviewPicture(PictureReviewRequest pictureReviewRequest, User loginUser) {
         if (loginUser == null) {
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
@@ -503,6 +603,15 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         if (oldPicture == null) {
             throw new BusinessException(ErrorCode.NOT_FOUND_ERROR, "图片不存在");
         }
+        if (!Objects.equals(oldPicture.getUploadStatus(), PictureUploadStatusEnum.COMPLETED.getValue())) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "草稿图片不能审核");
+        }
+        if (Objects.equals(oldPicture.getReviewStatus(), reviewStatus)) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "请勿重复审核");
+        }
+        if (StrUtil.length(pictureReviewRequest.getReviewMessage()) > 512) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "审核原因过长");
+        }
         PictureReviewStatusEnum statusEnum = PictureReviewStatusEnum.getEnumByValue(reviewStatus);
         Picture picture = new Picture();
         picture.setId(pictureId);
@@ -513,10 +622,12 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         if (!result) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "审核图片失败");
         }
+        pictureListRevision.advance();
         return true;
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public boolean editPicture(PictureEditRequest pictureEditRequest, User loginUser) {
         if (loginUser == null) {
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
@@ -524,12 +635,15 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         if (pictureEditRequest == null || pictureEditRequest.getId() == null) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片 ID 不能为空");
         }
+        validatePictureMetadata(pictureEditRequest.getName(), pictureEditRequest.getIntroduction(),
+                pictureEditRequest.getCategory(), pictureEditRequest.getTags());
         Picture picture = new Picture();
         org.springframework.beans.BeanUtils.copyProperties(pictureEditRequest, picture);
         if (pictureEditRequest.getTags() != null) {
             picture.setTags(JSONUtil.toJsonStr(pictureEditRequest.getTags()));
         }
         picture.setEditTime(new Date());
+        picture.setUploadStatus(PictureUploadStatusEnum.COMPLETED.getValue());
         validPicture(picture);
 
         Long pictureId = pictureEditRequest.getId();
@@ -553,10 +667,12 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         if (!isAdmin) {
             clearReviewDetail(pictureId);
         }
+        pictureListRevision.advance();
         return true;
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public boolean updatePicture(PictureUpdateRequest pictureUpdateRequest, User loginUser) {
         if (loginUser == null) {
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
@@ -567,8 +683,11 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         if (pictureUpdateRequest == null || pictureUpdateRequest.getId() == null) {
             throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片 ID 不能为空");
         }
+        validatePictureMetadata(pictureUpdateRequest.getName(), pictureUpdateRequest.getIntroduction(),
+                pictureUpdateRequest.getCategory(), pictureUpdateRequest.getTags());
         Picture picture = new Picture();
         org.springframework.beans.BeanUtils.copyProperties(pictureUpdateRequest, picture);
+        picture.setUploadStatus(PictureUploadStatusEnum.COMPLETED.getValue());
         if (pictureUpdateRequest.getTags() != null) {
             picture.setTags(JSONUtil.toJsonStr(pictureUpdateRequest.getTags()));
         }
@@ -584,6 +703,7 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
         if (!result) {
             throw new BusinessException(ErrorCode.OPERATION_ERROR, "更新失败");
         }
+        pictureListRevision.advance();
         return true;
     }
 
@@ -625,6 +745,59 @@ public class PictureServiceImpl extends ServiceImpl<PictureMapper, Picture>
                 .eq(Picture::getId, pictureId)
                 .set(Picture::getSourceUrl, null)
                 .update();
+    }
+
+    private void clearThumbnailUrl(Long pictureId) {
+        if (pictureId == null) {
+            return;
+        }
+        this.lambdaUpdate()
+                .eq(Picture::getId, pictureId)
+                .set(Picture::getThumbnailUrl, null)
+                .update();
+    }
+
+    /**
+     * 清理一条图片记录关联的全部受管 COS 文件。三个字段在兼容阶段可能指向同一对象，
+     * 所以必须先去重；替换上传时还要保留新对象，避免误删仍被新记录引用的文件。
+     */
+    private void cleanupManagedPictureFiles(Picture picture, String scene, String... retainedUrls) {
+        if (picture == null) {
+            return;
+        }
+        Set<String> retained = Arrays.stream(retainedUrls == null ? new String[0] : retainedUrls)
+                .filter(StrUtil::isNotBlank)
+                .collect(Collectors.toSet());
+        Stream.of(picture.getOriginalUrl(), picture.getUrl(), picture.getThumbnailUrl())
+                .filter(StrUtil::isNotBlank)
+                .distinct()
+                .filter(url -> !retained.contains(url))
+                .forEach(url -> pictureFileCleanupManager.deleteQuietly(url, scene));
+    }
+
+    private void cleanupUploadedPictureFiles(PictureUploadResult uploadResult, String scene) {
+        if (uploadResult == null) {
+            return;
+        }
+        Stream.of(uploadResult.getOriginalUrl(), uploadResult.getUrl(), uploadResult.getThumbnailUrl())
+                .filter(StrUtil::isNotBlank)
+                .distinct()
+                .forEach(url -> pictureFileCleanupManager.deleteQuietly(url, scene));
+    }
+
+    private void validatePictureMetadata(String name, String introduction, String category, List<String> tags) {
+        if (StrUtil.length(name) > 128) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片名称过长");
+        }
+        if (StrUtil.length(introduction) > 500) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片简介过长");
+        }
+        if (StrUtil.length(category) > 64) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片分类过长");
+        }
+        if (CollUtil.isNotEmpty(tags) && JSONUtil.toJsonStr(tags).length() > 512) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片标签过多或过长");
+        }
     }
 }
 

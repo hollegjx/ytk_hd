@@ -29,8 +29,10 @@ create index user_userName_index
 create table if not exists picture
 (
     id           bigint auto_increment comment 'id' primary key,
-    url          varchar(512)                           not null comment '图片 url',
-    sourceUrl    varchar(1024)                          null comment '原始图片来源 URL，仅内部使用',
+    url          varchar(512)                           not null comment '主展示图 URL；派生图未生成时回退为原图',
+    originalUrl  varchar(512)                           not null comment 'COS 原始文件 URL，用于重新处理和下载',
+    thumbnailUrl varchar(512)                           null comment '列表缩略图 URL；为空时前端回退使用 url',
+    sourceUrl    varchar(1024)                          null comment '外部图片来源 URL，仅用于追踪来源',
     name         varchar(128)                           not null comment '图片名称',
     introduction varchar(512)                           null comment '简介',
     category     varchar(64)                            null comment '分类',
@@ -41,6 +43,7 @@ create table if not exists picture
     picScale     double                                 null comment '图片宽高比例',
     picFormat    varchar(32)                            null comment '图片格式',
     userId       bigint                                 not null comment '创建用户 id',
+    uploadStatus tinyint  default 0                    not null comment '上传状态：0-草稿；1-已完成',
     reviewStatus int      default 0                    not null comment '审核状态：0-待审核；1-通过；2-拒绝',
     reviewMessage varchar(512)                          null comment '审核信息',
     reviewerId   bigint                                 null comment '审核人 ID',
@@ -54,5 +57,13 @@ create table if not exists picture
     INDEX idx_category (category),         -- 提升基于分类的查询性能
     INDEX idx_tags (tags),                 -- 提升基于标签的查询性能
     INDEX idx_userId (userId),             -- 提升基于用户 ID 的查询性能
+    INDEX idx_uploadStatus (uploadStatus), -- 提升草稿清理和已完成图片查询性能
     INDEX idx_reviewStatus (reviewStatus)  -- 提升基于审核状态的查询性能
 ) comment '图片' collate = utf8mb4_unicode_ci;
+
+-- 公开图片列表缓存的持久化失效版本
+CREATE TABLE IF NOT EXISTS picture_list_revision (
+    id TINYINT NOT NULL PRIMARY KEY,
+    revision BIGINT NOT NULL DEFAULT 0
+) ENGINE=InnoDB COMMENT='公开图片列表缓存版本';
+INSERT IGNORE INTO picture_list_revision (id, revision) VALUES (1, 0);

@@ -11,9 +11,19 @@ import java.io.Serializable;
 public class PictureUploadResult implements Serializable {
 
     /**
-     * 图片 URL
+     * 主展示图 URL；派生图不可用时回退为原图
      */
     private String url;
+
+    /**
+     * COS 原始文件 URL
+     */
+    private String originalUrl;
+
+    /**
+     * 列表缩略图 URL；未生成或收益不足时为空
+     */
+    private String thumbnailUrl;
 
     /**
      * 图片名称

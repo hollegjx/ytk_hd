@@ -22,11 +22,13 @@ import learn.gjx.tuku1.model.dto.picture.PictureProcessRule;
 import learn.gjx.tuku1.model.vo.PictureProcessInfoVO;
 import learn.gjx.tuku1.model.vo.PictureProcessResult;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.annotation.Resource;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -58,6 +60,24 @@ public class FileManager {
     private static final int READ_TIMEOUT_MS = 10000;
 
     private static final List<String> ALLOWED_PICTURE_SUFFIXES = Arrays.asList("jpg", "jpeg", "png", "gif", "webp");
+
+    @Value("${picture.derivative.enabled:true}")
+    private boolean derivativeEnabled = true;
+
+    @Value("${picture.derivative.display-quality:85}")
+    private int displayQuality = 85;
+
+    @Value("${picture.derivative.thumbnail-quality:80}")
+    private int thumbnailQuality = 80;
+
+    @Value("${picture.derivative.thumbnail-max-width:512}")
+    private int thumbnailMaxWidth = 512;
+
+    @Value("${picture.derivative.thumbnail-max-height:512}")
+    private int thumbnailMaxHeight = 512;
+
+    @Value("${picture.derivative.thumbnail-min-bytes:20480}")
+    private long thumbnailMinBytes = 20 * 1024L;
 
     @Resource
     private CosManager cosManager;
@@ -121,6 +141,7 @@ public class FileManager {
         String suffix = FileUtil.getSuffix(originalFilename);
         validatePictureSize(fileSize);
         validatePictureSuffix(suffix);
+        validatePictureSignature(file, suffix);
 
         String uploadFilename = String.format("%s_%s.%s",
                 DateUtil.formatDate(new Date()),
@@ -128,21 +149,145 @@ public class FileManager {
                 suffix);
         String uploadPath = String.format("%s/%s", uploadPathPrefix, uploadFilename);
 
-        PutObjectResult putObjectResult = cosManager.putPictureObject(uploadPath, file);
-        ImageInfo imageInfo = putObjectResult.getCiUploadResult().getOriginalInfo().getImageInfo();
+        DerivativePlan derivativePlan = buildDerivativePlan(uploadPath, suffix, fileSize);
+        try {
+            PutObjectResult putObjectResult = cosManager.putPictureObject(
+                    uploadPath, file, derivativePlan.getPicOperations());
+            return buildUploadResult(putObjectResult, derivativePlan, originalFilename, fileSize);
+        } catch (RuntimeException e) {
+            // 数据万象处理异常时，原图可能已经写入 COS。清理所有已知 Key，避免产生孤儿文件。
+            cleanupObjectQuietly(uploadPath, "upload-failed");
+            cleanupObjectQuietly(derivativePlan.getDisplayKey(), "upload-failed");
+            cleanupObjectQuietly(derivativePlan.getThumbnailKey(), "upload-failed");
+            throw e;
+        }
+    }
+
+    private DerivativePlan buildDerivativePlan(String originalKey, String suffix, long fileSize) {
+        PicOperations picOperations = new PicOperations();
+        picOperations.setIsPicInfo(1);
+        List<PicOperations.Rule> rules = new ArrayList<>();
+        String normalizedSuffix = StrUtil.blankToDefault(suffix, "").toLowerCase(Locale.ROOT);
+        String baseKey = removeFileSuffix(originalKey);
+        String displayKey = null;
+        String thumbnailKey = null;
+
+        // GIF 转 WebP 是否保留动画依赖云端处理能力，未验证前保留原始 GIF，避免静态化。
+        if (derivativeEnabled && !"gif".equals(normalizedSuffix)) {
+            if (!"webp".equals(normalizedSuffix)) {
+                displayKey = baseKey + "_display.webp";
+                rules.add(buildDerivativeRule(displayKey,
+                        String.format("imageMogr2/format/webp/quality/%d", displayQuality)));
+            }
+            if (fileSize > thumbnailMinBytes) {
+                thumbnailKey = baseKey + "_thumbnail.webp";
+                rules.add(buildDerivativeRule(thumbnailKey,
+                        String.format("imageMogr2/thumbnail/%dx%d>/format/webp/quality/%d",
+                                thumbnailMaxWidth, thumbnailMaxHeight, thumbnailQuality)));
+            }
+        }
+        picOperations.setRules(rules);
+        return new DerivativePlan(originalKey, displayKey, thumbnailKey, picOperations);
+    }
+
+    private PicOperations.Rule buildDerivativeRule(String outputKey, String rule) {
+        PicOperations.Rule derivativeRule = new PicOperations.Rule();
+        derivativeRule.setBucket(cosClientConfig.getBucket());
+        // COS 的 fileId 不以 / 开头时是相对原图目录；使用绝对路径避免重复拼接 public/{userId}。
+        derivativeRule.setFileId("/" + StrUtil.removePrefix(outputKey, "/"));
+        derivativeRule.setRule(rule);
+        return derivativeRule;
+    }
+
+    private PictureUploadResult buildUploadResult(PutObjectResult putObjectResult, DerivativePlan derivativePlan,
+                                                  String originalFilename, long originalSize) {
+        CIUploadResult ciUploadResult = putObjectResult == null ? null : putObjectResult.getCiUploadResult();
+        ImageInfo imageInfo = ciUploadResult == null || ciUploadResult.getOriginalInfo() == null
+                ? null : ciUploadResult.getOriginalInfo().getImageInfo();
+        if (imageInfo == null || imageInfo.getWidth() <= 0 || imageInfo.getHeight() <= 0) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "图片元信息解析失败");
+        }
+
+        List<CIObject> processedObjects = new ArrayList<>();
+        ProcessResults processResults = ciUploadResult.getProcessResults();
+        if (processResults != null && CollUtil.isNotEmpty(processResults.getObjectList())) {
+            processedObjects.addAll(processResults.getObjectList());
+        }
+
+        String originalUrl = getFileUrl(derivativePlan.getOriginalKey());
+        CIObject displayObject = findProcessedObject(processedObjects, derivativePlan.getDisplayKey());
+        String displayUrl = originalUrl;
+        long displaySize = originalSize;
+        if (displayObject != null) {
+            if (isSmaller(displayObject, originalSize)) {
+                displayUrl = getFileUrl(derivativePlan.getDisplayKey());
+                displaySize = displayObject.getSize();
+            } else {
+                cleanupObjectQuietly(displayObject.getKey(), "display-not-smaller");
+            }
+        } else if (StrUtil.isNotBlank(derivativePlan.getDisplayKey())) {
+            log.warn("COS 未返回主展示派生图，回退原图, key: {}", derivativePlan.getDisplayKey());
+        }
+
+        CIObject thumbnailObject = findProcessedObject(processedObjects, derivativePlan.getThumbnailKey());
+        String thumbnailUrl = null;
+        if (thumbnailObject != null) {
+            if (isSmaller(thumbnailObject, displaySize)) {
+                thumbnailUrl = getFileUrl(derivativePlan.getThumbnailKey());
+            } else {
+                cleanupObjectQuietly(thumbnailObject.getKey(), "thumbnail-not-smaller");
+            }
+        } else if (StrUtil.isNotBlank(derivativePlan.getThumbnailKey())) {
+            log.warn("COS 未返回缩略派生图，前端将回退主展示图, key: {}", derivativePlan.getThumbnailKey());
+        }
+
         int picWidth = imageInfo.getWidth();
         int picHeight = imageInfo.getHeight();
-        double picScale = NumberUtil.round(picWidth * 1.0 / picHeight, 2).doubleValue();
-
         PictureUploadResult result = new PictureUploadResult();
-        result.setUrl(getFileUrl(uploadPath));
+        result.setUrl(displayUrl);
+        result.setOriginalUrl(originalUrl);
+        result.setThumbnailUrl(thumbnailUrl);
         result.setPicName(FileUtil.mainName(originalFilename));
-        result.setPicSize(fileSize);
+        result.setPicSize(originalSize);
         result.setPicFormat(imageInfo.getFormat());
         result.setPicWidth(picWidth);
         result.setPicHeight(picHeight);
-        result.setPicScale(picScale);
+        result.setPicScale(NumberUtil.round(picWidth * 1.0 / picHeight, 2).doubleValue());
         return result;
+    }
+
+    private CIObject findProcessedObject(List<CIObject> objects, String expectedKey) {
+        if (StrUtil.isBlank(expectedKey)) {
+            return null;
+        }
+        String normalizedExpectedKey = StrUtil.removePrefix(expectedKey, "/");
+        return CollUtil.emptyIfNull(objects).stream()
+                .filter(object -> object != null && StrUtil.isNotBlank(object.getKey()))
+                .filter(object -> normalizedExpectedKey.equals(StrUtil.removePrefix(object.getKey(), "/")))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private boolean isSmaller(CIObject object, long baselineSize) {
+        return object.getSize() != null && object.getSize() > 0
+                && (baselineSize <= 0 || object.getSize() < baselineSize);
+    }
+
+    private String removeFileSuffix(String key) {
+        int slashIndex = key.lastIndexOf('/');
+        int dotIndex = key.lastIndexOf('.');
+        return dotIndex > slashIndex ? key.substring(0, dotIndex) : key;
+    }
+
+    private void cleanupObjectQuietly(String key, String scene) {
+        if (StrUtil.isBlank(key)) {
+            return;
+        }
+        try {
+            cosManager.deleteObject(StrUtil.removePrefix(key, "/"));
+        } catch (Exception cleanupException) {
+            log.error("清理 COS 对象失败, scene: {}, key: {}", scene, key, cleanupException);
+        }
     }
 
     /**
@@ -168,7 +313,21 @@ public class FileManager {
         if (StrUtil.startWith(url, httpPrefix)) {
             return url.substring(httpPrefix.length());
         }
-        return url;
+        return null;
+    }
+
+    /**
+     * 删除当前 COS 中的图片。外部 URL 不会被当作对象 Key 删除。
+     *
+     * @return 是否识别并执行了删除
+     */
+    public boolean deletePicture(String pictureUrl) {
+        String key = extractKeyFromUrl(pictureUrl);
+        if (StrUtil.isBlank(key)) {
+            return false;
+        }
+        cosManager.deleteObject(key);
+        return true;
     }
 
     /**
@@ -203,6 +362,41 @@ public class FileManager {
     private boolean isAllowedPictureSuffix(String suffix) {
         return StrUtil.isNotBlank(suffix)
                 && ALLOWED_PICTURE_SUFFIXES.contains(suffix.toLowerCase(Locale.ROOT));
+    }
+
+    private void validatePictureSignature(File file, String suffix) {
+        byte[] header = new byte[12];
+        int length;
+        try (InputStream inputStream = new FileInputStream(file)) {
+            length = inputStream.read(header);
+        } catch (IOException e) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "读取图片内容失败");
+        }
+        String normalizedSuffix = suffix.toLowerCase(Locale.ROOT);
+        boolean valid;
+        if ("jpg".equals(normalizedSuffix) || "jpeg".equals(normalizedSuffix)) {
+            valid = length >= 3 && unsigned(header[0]) == 0xFF && unsigned(header[1]) == 0xD8
+                    && unsigned(header[2]) == 0xFF;
+        } else if ("png".equals(normalizedSuffix)) {
+            valid = length >= 8 && unsigned(header[0]) == 0x89 && header[1] == 'P' && header[2] == 'N'
+                    && header[3] == 'G';
+        } else if ("gif".equals(normalizedSuffix)) {
+            valid = length >= 6 && header[0] == 'G' && header[1] == 'I' && header[2] == 'F'
+                    && header[3] == '8' && (header[4] == '7' || header[4] == '9') && header[5] == 'a';
+        } else if ("webp".equals(normalizedSuffix)) {
+            valid = length >= 12 && header[0] == 'R' && header[1] == 'I' && header[2] == 'F'
+                    && header[3] == 'F' && header[8] == 'W' && header[9] == 'E'
+                    && header[10] == 'B' && header[11] == 'P';
+        } else {
+            valid = false;
+        }
+        if (!valid) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "图片内容与文件格式不匹配");
+        }
+    }
+
+    private int unsigned(byte value) {
+        return value & 0xFF;
     }
 
     private URL validateRemotePictureUrl(String fileUrl) {
@@ -522,6 +716,41 @@ public class FileManager {
 
         public long getFileSize() {
             return fileSize;
+        }
+    }
+
+    private static class DerivativePlan {
+
+        private final String originalKey;
+
+        private final String displayKey;
+
+        private final String thumbnailKey;
+
+        private final PicOperations picOperations;
+
+        private DerivativePlan(String originalKey, String displayKey, String thumbnailKey,
+                               PicOperations picOperations) {
+            this.originalKey = originalKey;
+            this.displayKey = displayKey;
+            this.thumbnailKey = thumbnailKey;
+            this.picOperations = picOperations;
+        }
+
+        public String getOriginalKey() {
+            return originalKey;
+        }
+
+        public String getDisplayKey() {
+            return displayKey;
+        }
+
+        public String getThumbnailKey() {
+            return thumbnailKey;
+        }
+
+        public PicOperations getPicOperations() {
+            return picOperations;
         }
     }
 }

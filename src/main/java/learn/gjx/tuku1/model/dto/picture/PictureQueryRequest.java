@@ -72,6 +72,11 @@ public class PictureQueryRequest implements Serializable {
     private Long userId;
 
     /**
+     * 上传状态：0-草稿；1-已完成
+     */
+    private Integer uploadStatus;
+
+    /**
      * 审核状态：0-待审核；1-通过；2-拒绝
      */
     private Integer reviewStatus;

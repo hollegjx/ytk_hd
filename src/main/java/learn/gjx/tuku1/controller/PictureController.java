@@ -10,6 +10,7 @@ import learn.gjx.tuku1.model.dto.picture.*;
 import learn.gjx.tuku1.model.entity.Picture;
 import learn.gjx.tuku1.model.entity.User;
 import learn.gjx.tuku1.model.enums.PictureReviewStatusEnum;
+import learn.gjx.tuku1.model.enums.PictureUploadStatusEnum;
 import learn.gjx.tuku1.model.enums.UserRoleEnum;
 import learn.gjx.tuku1.model.vo.PictureProcessResult;
 import learn.gjx.tuku1.model.vo.PictureTagCategory;
@@ -103,12 +104,8 @@ public class PictureController {
         ThrowUtils.throwIf(deleteRequest == null || deleteRequest.getId() == null, ErrorCode.PARAMS_ERROR);
         Long id = deleteRequest.getId();
         ThrowUtils.throwIf(id <= 0, ErrorCode.PARAMS_ERROR, "图片 ID 不合法");
-        // 判断图片是否存在
-        Picture oldPicture = pictureService.getById(id);
-        ThrowUtils.throwIf(oldPicture == null, ErrorCode.NOT_FOUND_ERROR, "图片不存在");
-        // 删除图片
-        boolean result = pictureService.removeById(id);
-        ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "删除失败");
+        User loginUser = userService.getLoginUser(request);
+        pictureService.deletePicture(id, loginUser);
         return BaseResponse.success(true);
     }
 
@@ -144,7 +141,9 @@ public class PictureController {
         ThrowUtils.throwIf(id <= 0, ErrorCode.PARAMS_ERROR, "图片 ID 不合法");
         Picture picture = pictureService.getById(id);
         ThrowUtils.throwIf(picture == null, ErrorCode.NOT_FOUND_ERROR, "图片不存在");
-        if (!Objects.equals(picture.getReviewStatus(), PictureReviewStatusEnum.PASS.getValue())) {
+        boolean publiclyVisible = Objects.equals(picture.getUploadStatus(), PictureUploadStatusEnum.COMPLETED.getValue())
+                && Objects.equals(picture.getReviewStatus(), PictureReviewStatusEnum.PASS.getValue());
+        if (!publiclyVisible) {
             User loginUser = userService.getLoginUser(request);
             if (!Objects.equals(picture.getUserId(), loginUser.getId()) && !userService.isAdmin(loginUser)) {
                 throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "图片未审核通过");
@@ -181,6 +180,7 @@ public class PictureController {
         if (queryRequest.getReviewStatus() == null) {
             queryRequest.setReviewStatus(PictureReviewStatusEnum.REVIEWING.getValue());
         }
+        queryRequest.setUploadStatus(PictureUploadStatusEnum.COMPLETED.getValue());
         int current = queryRequest.getCurrent();
         int pageSize = queryRequest.getPageSize();
         Page<Picture> picturePage = pictureService.page(new Page<>(current, pageSize),
@@ -194,17 +194,7 @@ public class PictureController {
     @PostMapping("/list/page/vo")
     public BaseResponse<Page<PictureVO>> listPictureVOByPage(@RequestBody PictureQueryRequest queryRequest,
                                                              HttpServletRequest request) {
-        if (queryRequest == null) {
-            queryRequest = new PictureQueryRequest();
-        }
-        int current = queryRequest.getCurrent();
-        int pageSize = queryRequest.getPageSize();
-        // 限制每页数量，防止爬虫
-        ThrowUtils.throwIf(pageSize > 20, ErrorCode.PARAMS_ERROR, "每页数量不能超过 20");
-        queryRequest.setReviewStatus(PictureReviewStatusEnum.PASS.getValue());
-        Page<Picture> picturePage = pictureService.page(new Page<>(current, pageSize),
-                pictureService.getQueryWrapper(queryRequest));
-        return BaseResponse.success(pictureService.getPictureVOPage(picturePage, request));
+        return BaseResponse.success(pictureService.listPublicPicturePage(queryRequest, request));
     }
 
     /**

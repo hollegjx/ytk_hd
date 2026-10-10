@@ -15,6 +15,8 @@ import lombok.Data;
 @TableName(value ="user")
 @Data
 public class LoginUserVO implements Serializable {
+    private static final long serialVersionUID = 1L;
+
     /**
      * 唯一id
      */

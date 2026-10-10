@@ -21,9 +21,14 @@ public class PictureVO implements Serializable {
     private Long id;
 
     /**
-     * 图片 url
+     * 主展示图 URL；派生图未生成时为原图
      */
     private String url;
+
+    /**
+     * 列表缩略图 URL；为空时客户端回退使用 url
+     */
+    private String thumbnailUrl;
 
     /**
      * 图片名称
@@ -74,6 +79,11 @@ public class PictureVO implements Serializable {
      * 创建用户 id
      */
     private Long userId;
+
+    /**
+     * 上传状态：0-草稿；1-已完成
+     */
+    private Integer uploadStatus;
 
     /**
      * 创建用户信息

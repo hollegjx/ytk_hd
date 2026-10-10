@@ -19,11 +19,15 @@ import org.springframework.web.multipart.MultipartFile;
 
 import javax.servlet.http.HttpServletRequest;
 import java.util.List;
+import java.util.Date;
 
 /**
  * picture 表相关的核心服务接口，包含上传、查询与图片处理能力。
  */
 public interface PictureService extends IService<Picture> {
+
+    /** 公开列表：统一校验、强制公开状态、Redis 缓存及最新用户信息补全。 */
+    Page<PictureVO> listPublicPicturePage(PictureQueryRequest queryRequest, HttpServletRequest request);
 
     /**
      * 上传或更新图片，并同步保存元数据。
@@ -39,6 +43,16 @@ public interface PictureService extends IService<Picture> {
      * 管理员通过搜索关键词批量导入图片。
      */
     Integer uploadPictureByBatch(PictureUploadByBatchRequest pictureUploadByBatchRequest, User loginUser);
+
+    /**
+     * 删除图片记录，并在数据库操作成功后清理对应 COS 文件。
+     */
+    boolean deletePicture(Long pictureId, User loginUser);
+
+    /**
+     * 清理指定时间之前仍未提交的上传草稿。
+     */
+    int cleanExpiredDraftPictures(Date expireBefore, int batchSize);
 
     /**
      * 根据查询条件构建 MyBatis-Plus 的 QueryWrapper。

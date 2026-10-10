@@ -22,6 +22,7 @@ import learn.gjx.tuku1.service.UserService;
 import org.springframework.stereotype.Service;
 
 import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpSession;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -110,8 +111,10 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
         // 脱敏后的登录用户信息
         LoginUserVO loginUserVO = userLogin(user);
 
-        // 保存登录态
-        request.getSession().setAttribute(UserConstant.USER_LOGIN_STATE, loginUserVO);
+        // 登录成功后更换会话 ID，避免沿用登录前的会话标识。
+        HttpSession session = request.getSession();
+        request.changeSessionId();
+        session.setAttribute(UserConstant.USER_LOGIN_STATE, loginUserVO);
 
         return loginUserVO;
     }
@@ -160,8 +163,9 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
     @Override
     public User getLoginUser(HttpServletRequest request) {
         // 从 session 获取登录态
-        Object userObj = request.getSession().getAttribute(UserConstant.USER_LOGIN_STATE);
-        if (userObj == null) {
+        HttpSession session = request.getSession(false);
+        Object userObj = session == null ? null : session.getAttribute(UserConstant.USER_LOGIN_STATE);
+        if (!(userObj instanceof LoginUserVO)) {
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR, "未登录");
         }
 
@@ -185,12 +189,13 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements Us
 
     @Override
     public boolean userLogout(HttpServletRequest request) {
-        Object userObj = request.getSession().getAttribute(UserConstant.USER_LOGIN_STATE);
+        HttpSession session = request.getSession(false);
+        Object userObj = session == null ? null : session.getAttribute(UserConstant.USER_LOGIN_STATE);
         if (userObj == null) {
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR, "未登录");
         }
 
-        request.getSession().removeAttribute(UserConstant.USER_LOGIN_STATE);
+        session.invalidate();
         return true;
     }
 
